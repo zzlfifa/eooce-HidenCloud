@@ -86,30 +86,53 @@ def send_telegram_notification(status, old_due, new_due):
         return False
 
 def handle_cloudflare(page):
+    """等待 Cloudflare / HidenCloud 安全验证通过。
+    新版站点会在页面加载前插入自定义安全验证页（标题含 Security Verification / 请稍候），
+    且登录表单带 Turnstile，需等 token 生成后再提交。"""
     iframe_selector = 'iframe[src*="challenges.cloudflare.com"]'
-    if page.locator(iframe_selector).count() == 0:
-        return True
-    log("⚠️ 检测到 Cloudflare 验证...")
+    if page.locator(iframe_selector).count() > 0:
+        log("⚠️ 检测到 Cloudflare 验证...")
     start_time = time.time()
-    while time.time() - start_time < 60:
-        if page.locator(iframe_selector).count() == 0:
-            log("✅ Cloudflare 验证通过！")
+    while time.time() - start_time < 90:
+        try:
+            title = page.title().lower()
+            url = page.url
+            iframe_count = page.locator(iframe_selector).count()
+        except Exception:
+            time.sleep(1)
+            continue
+        if (iframe_count == 0 and "__cf_chl_rt_tk" not in url
+                and "security verification" not in title and "请稍候" not in title):
             return True
         try:
             frame = page.frame_locator(iframe_selector)
             checkbox = frame.locator('input[type="checkbox"]')
-            if checkbox.is_visible():
+            if checkbox.count() and checkbox.is_visible():
                 log("🖱️ 点击验证复选框...")
                 time.sleep(random.uniform(0.5, 1.5))
                 checkbox.click()
                 log("⏳ 已点击，等待验证结果...")
                 time.sleep(5)
-            else:
-                time.sleep(1)
         except Exception:
             pass
+        time.sleep(2)
     log("❌ 验证超时。")
     return False
+
+def wait_turnstile_token(page, timeout_s=90):
+    """等待登录表单中 Turnstile 隐藏字段拿到 token，否则提交会报
+    'The cf-turnstile-response field is required.'"""
+    try:
+        page.wait_for_function(
+            "() => { const i = document.querySelector('input[name=\"cf-turnstile-response\"]');"
+            " return i && i.value && i.value.length > 10; }",
+            timeout=timeout_s * 1000,
+        )
+        log("✅ Turnstile token 已生成")
+        return True
+    except Exception:
+        log("⚠️ 未获取到 Turnstile token，继续尝试提交...")
+        return False
 
 def login(page):
     # 1. Cookie 登录尝试
@@ -144,10 +167,19 @@ def login(page):
     try:
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
-        page.fill('input[name="email"]', EMAIL)
+        # 新版登录页: 字段名为 username（支持邮箱或用户名）
+        page.wait_for_selector('input[name="username"]', state="visible", timeout=120000)
+        log("🔑 登录表单已出现，填写账号...")
+        page.fill('input[name="username"]', EMAIL)
         page.fill('input[name="password"]', PASSWORD)
+        try:
+            page.check('input[name="remember"]')
+        except Exception:
+            pass
         time.sleep(0.5)
         handle_cloudflare(page)
+        # 必须等 Turnstile token 生成后再提交，否则报 cf-turnstile-response required
+        wait_turnstile_token(page, 90)
         page.click('button[type="submit"]')
         time.sleep(3)
         handle_cloudflare(page)
