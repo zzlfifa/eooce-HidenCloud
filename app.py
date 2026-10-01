@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os,re,sys,time,random,requests
+from datetime import datetime
 from playwright.sync_api import sync_playwright
 
 # --- 环境变量 ---
@@ -339,6 +340,16 @@ def parse_due_date(page):
             return match.group(1).strip()
     return "未知"
 
+def days_until_due(due_str):
+    """解析 '09 Oct 2026' 格式的到期日,计算距今天(UTC)的天数。
+    解析失败返回 None(此时不做窗口拦截,交给后续弹窗/Renewal Restricted 检测)。"""
+    try:
+        due = datetime.strptime(due_str.strip(), "%d %b %Y")
+        today = datetime.strptime(time.strftime("%d %b %Y", time.gmtime()), "%d %b %Y")
+        return (due - today).days
+    except Exception:
+        return None
+
 def get_due_date(page):
     try:
         if not goto_service_page(page):
@@ -579,6 +590,14 @@ def main():
             # 获取旧到期时间
             old_due = get_due_date(page)
             log(f"📆 续费前到期时间：{old_due}")
+
+            # 续期窗口判定: 站点仅在到期日前一天开放续期,其余时间点击 Renew
+            # 会被拒绝(弹窗不打开/Renewal Restricted),直接跳过,不做无效尝试
+            days_left = days_until_due(old_due)
+            if days_left is not None and days_left > 1:
+                log(f"⏳ 距到期还有 {days_left} 天(续期窗口为到期前一天)，未到续期时间")
+                send_telegram_notification("⏳ 未到续期时间", old_due, old_due)
+                sys.exit(0)
 
             # 执行续期: 创建发票
             invoice_url = create_invoice(page, server_id)
