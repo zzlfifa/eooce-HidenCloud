@@ -59,7 +59,7 @@ def send_telegram_notification(status, old_due, new_due):
         masked_email = EMAIL[:2] + '****'
 
     text = (
-        f"HidenCloud 续期通知\n\n"
+        f"🎉 HidenCloud 续期通知\n\n"
         f"{status}\n"
         f"👤 账号: {masked_email}\n"
         f"📅 续期前到期：{old_due}\n"
@@ -353,20 +353,21 @@ def get_due_date(page):
 def create_invoice(page, server_id, max_rounds=4):
     """打开 Renew 弹窗并创建续期发票。
     成功的唯一标志: URL 跳转到 /payment/invoice/<uuid>(发票真正创建)。
-    返回发票 URL;未到续期时间返回 'NOT_TIME';失败返回 None。"""
+    返回发票 URL;未到续期时间返回 'NOT_TIME';失败返回 None。
+
+    站点实测行为:
+    - 可续期时: 点击 Renew 后弹窗打开,弹窗内 Turnstile 开始运行,
+      点击 Create Invoice 后跳转发票页。
+    - 已续期/未到窗口时: 点击 Renew 后弹窗不会打开,页面会出现
+      'Renewal Restricted' / 'can only renew' 提示,且无法创建发票。"""
+    rendered_rounds = 0
     for rnd in range(1, max_rounds + 1):
         log(f"🔄 创建发票 第 {rnd}/{max_rounds} 轮")
         try:
             if not goto_service_page(page):
                 continue
+            rendered_rounds += 1
             time.sleep(2)
-
-            # 未到续期时间检测（站点会在到期前 N 天外限制续期）
-            page_text = page.locator("body").inner_text()
-            if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
-                log("⏳ 未到续期时间，无法续期。")
-                page.screenshot(path="renew_not_allowed.png")
-                return "NOT_TIME"
 
             # 1. 打开 Renew 弹窗
             ok = js_click_exact(page, "Renew", "Renew")
@@ -374,18 +375,41 @@ def create_invoice(page, server_id, max_rounds=4):
                 log(f"⚠️ 未找到 Renew 按钮，重试...")
                 continue
 
-            # 2. 等待弹窗真正打开
+            # 2. 同时等待两种结果: 弹窗打开(可续期) 或 出现受限提示
+            #    (已续期状态下弹窗不会打开,点击后页面才出现 Renewal Restricted)
             modal_open = False
+            restricted_hits = 0
             for _w in range(15):
                 time.sleep(2)
-                opened = page.evaluate(
-                    """(sid) => {
-                        const c = document.getElementById('renewService-' + sid);
-                        return c ? !c.classList.contains('hidden') : false;
-                    }""", server_id)
+                try:
+                    opened = page.evaluate(
+                        """(sid) => {
+                            const c = document.getElementById('renewService-' + sid);
+                            return c ? !c.classList.contains('hidden') : false;
+                        }""", server_id)
+                except Exception:
+                    opened = False
                 if opened:
                     modal_open = True
                     break
+                try:
+                    t = page.locator("body").inner_text()
+                    if "Renewal Restricted" in t or "can only renew" in t.lower():
+                        restricted_hits += 1
+                    else:
+                        restricted_hits = 0
+                except Exception:
+                    pass
+                if restricted_hits >= 2:
+                    break
+
+            if not modal_open and restricted_hits >= 2:
+                log("⏳ 站点提示 Renewal Restricted,未到续期时间。")
+                try:
+                    page.screenshot(path="renew_not_allowed.png")
+                except Exception:
+                    pass
+                return "NOT_TIME"
             if not modal_open:
                 log(f"⚠️ 第 {rnd} 轮 Renew 弹窗未打开，重试...")
                 try:
@@ -430,6 +454,11 @@ def create_invoice(page, server_id, max_rounds=4):
                 page.screenshot(path=f"invoice_error_r{rnd}.png")
             except Exception:
                 pass
+    if rendered_rounds > 0:
+        # 页面渲染正常、Renew 已点击,但多轮后弹窗始终不打开也无需支付:
+        # 该状态即"已续期过/未到续期窗口"(站点此时不允许创建发票),不算失败。
+        log("⏳ 多轮尝试后 Renew 弹窗始终未打开(该状态下站点不允许创建发票)，判定为未到续期时间。")
+        return "NOT_TIME"
     return None
 
 def find_unpaid_invoice(page, server_id):
